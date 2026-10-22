@@ -1,7 +1,50 @@
-import { Pool } from "pg";
+import { Pool, type PoolConfig } from "pg";
 import { takePage, type HistoryPage, type PageRequest } from "./history-cursor";
 
 let pool: Pool | undefined;
+
+/** pg's own defaults, pinned here so the pool behaves the same across pg upgrades. */
+const DEFAULT_POOL_MAX = 10;
+const DEFAULT_IDLE_TIMEOUT_MS = 10_000;
+
+type EnvLike = Record<string, string | undefined>;
+
+function parsePositiveInt(name: string, raw: string | undefined, fallback: number): number {
+  const value = raw?.trim();
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer, got ${JSON.stringify(raw)}`);
+  }
+  return parsed;
+}
+
+/**
+ * `DATABASE_SSL` turns on TLS for managed Postgres. `no-verify` encrypts without
+ * validating the server certificate, for providers whose CA is not in Node's
+ * trust store. Unset means no TLS, which is what local compose uses.
+ */
+function parseSsl(raw: string | undefined): PoolConfig["ssl"] {
+  const value = raw?.trim().toLowerCase();
+  if (!value || value === "false") return undefined;
+  if (value === "true") return true;
+  if (value === "no-verify") return { rejectUnauthorized: false };
+  throw new Error(`DATABASE_SSL must be "true", "false" or "no-verify", got ${JSON.stringify(raw)}`);
+}
+
+/** Build the pool's config from an environment, defaulting to pg's values. */
+export function poolConfigFromEnv(env: EnvLike): PoolConfig {
+  return {
+    connectionString: env.DATABASE_URL,
+    max: parsePositiveInt("DATABASE_POOL_MAX", env.DATABASE_POOL_MAX, DEFAULT_POOL_MAX),
+    idleTimeoutMillis: parsePositiveInt(
+      "DATABASE_IDLE_TIMEOUT_MS",
+      env.DATABASE_IDLE_TIMEOUT_MS,
+      DEFAULT_IDLE_TIMEOUT_MS
+    ),
+    ssl: parseSsl(env.DATABASE_SSL),
+  };
+}
 
 /** Whether a Postgres-backed indexer is configured for this deployment (see indexer/). */
 export function isIndexerConfigured(): boolean {
@@ -9,7 +52,7 @@ export function isIndexerConfigured(): boolean {
 }
 
 function getPool(): Pool {
-  if (!pool) pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  if (!pool) pool = new Pool(poolConfigFromEnv(process.env));
   return pool;
 }
 
