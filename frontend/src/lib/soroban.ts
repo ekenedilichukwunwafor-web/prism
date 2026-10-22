@@ -16,7 +16,14 @@ import {
 import { config } from "./config";
 import type { HistoryPage, PageRequest } from "./history-cursor";
 import { EVENT_PAGE_SIZE, INVOCATION_PAGE_SIZE } from "./contract-lists";
-import { isIndexerConfigured, getIndexedInvocations, getIndexedEvents, getIndexedStorageEntries } from "./indexed-db";
+import {
+  isIndexerConfigured,
+  getIndexedContract,
+  getIndexedInvocations,
+  getIndexedEvents,
+  getIndexedStorageEntries,
+  getIndexedInvocationReturnValue,
+} from "./indexed-db";
 
 const RPC_URL = config.sorobanRpcUrl;
 
@@ -42,6 +49,19 @@ export async function getContractInfo(contractId: string): Promise<ContractInfo 
       value: scValToDisplay(e.val()),
       durability: "instance" as const,
     }));
+
+    const assetDetails: { name?: string; symbol?: string; decimals?: number } = {};
+    if (!isWasm) {
+      for (const entry of instanceStorage) {
+        if (entry.key === "name") assetDetails.name = entry.value;
+        if (entry.key === "symbol") assetDetails.symbol = entry.value;
+        if (entry.key === "decimals") {
+          const dec = Number(entry.value);
+          if (!isNaN(dec)) assetDetails.decimals = dec;
+        }
+      }
+    }
+
     info = {
       executable: isWasm ? "wasm" : "stellar_asset",
       wasmHash: isWasm ? executable.wasmHash().toString("hex") : undefined,
@@ -167,6 +187,15 @@ export async function getContractEvents(contractId: string, limit = EVENT_PAGE_S
   return (await getContractEventsPage(contractId, { limit })).items;
 }
 
+export interface ContractEventsPage extends HistoryPage<ContractEvent> {
+  /**
+   * Human-readable reason the RPC lookup failed, or null on success. Kept
+   * separate from `items` so an RPC outage isn't mistaken for a contract that
+   * genuinely emitted no events.
+   */
+  error: string | null;
+}
+
 /**
  * One page of a contract's events, newest first. The indexer's history pages
  * by cursor. The RPC fallback only has its retention window, so it returns that
@@ -175,7 +204,7 @@ export async function getContractEvents(contractId: string, limit = EVENT_PAGE_S
 export async function getContractEventsPage(
   contractId: string,
   request: PageRequest
-): Promise<HistoryPage<ContractEvent>> {
+): Promise<ContractEventsPage> {
   if (isIndexerConfigured()) {
     const indexed = await getIndexedEvents(contractId, request);
     return {
@@ -190,13 +219,19 @@ export async function getContractEventsPage(
         timestamp: e.createdAt,
       })),
       nextCursor: indexed.nextCursor,
+      error: null,
     };
   }
-  if (request.before) return { items: [], nextCursor: null };
-  return { items: await getContractEventsFromRpc(contractId, request.limit), nextCursor: null };
+  if (request.before) return { items: [], nextCursor: null, error: null };
+  return { ...(await getContractEventsFromRpc(contractId, request.limit)), nextCursor: null };
 }
 
-async function getContractEventsFromRpc(contractId: string, limit: number): Promise<ContractEvent[]> {
+interface RpcEventsResult {
+  items: ContractEvent[];
+  error: string | null;
+}
+
+async function getContractEventsFromRpc(contractId: string, limit: number): Promise<RpcEventsResult> {
   try {
     const s = server();
     const latest = await s.getLatestLedger();
@@ -206,7 +241,7 @@ async function getContractEventsFromRpc(contractId: string, limit: number): Prom
       filters: [{ type: "contract", contractIds: [contractId] }],
       limit,
     });
-    return res.events
+    const items = res.events
       .map((e) => ({
         id: e.id,
         contractId,
@@ -218,8 +253,12 @@ async function getContractEventsFromRpc(contractId: string, limit: number): Prom
         timestamp: e.ledgerClosedAt,
       }))
       .reverse();
-  } catch {
-    return [];
+    return { items, error: null };
+  } catch (err) {
+    return {
+      items: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
@@ -254,7 +293,7 @@ export async function getInvocationHistoryPage(
 }
 
 async function getInvocationHistoryFromRpc(contractId: string, limit: number): Promise<InvocationHistoryItem[]> {
-  const events = await getContractEventsFromRpc(contractId, 200);
+  const { items: events } = await getContractEventsFromRpc(contractId, 200);
   const txHashes = Array.from(new Set(events.map((e) => e.txHash))).slice(0, limit);
 
   const CONCURRENCY = 4;

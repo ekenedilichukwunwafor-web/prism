@@ -160,6 +160,7 @@ describe("getContractEvents", () => {
     await expect(getContractEventsPage("contract-id", { limit: 2 })).resolves.toEqual({
       items: [],
       nextCursor: "next-page",
+      error: null,
     });
   });
 
@@ -169,7 +170,7 @@ describe("getContractEvents", () => {
 
     await expect(
       getContractEventsPage("contract-id", { limit: 2, before: { ledger: 5, id: "row" } })
-    ).resolves.toEqual({ items: [], nextCursor: null });
+    ).resolves.toEqual({ items: [], nextCursor: null, error: null });
     expect(rpcSpy).not.toHaveBeenCalled();
   });
 
@@ -192,6 +193,25 @@ describe("getContractEvents", () => {
       },
     ]);
     expect(getIndexedEvents).not.toHaveBeenCalled();
+  });
+
+  it("keeps an RPC failure separate from a genuinely empty result", async () => {
+    vi.mocked(isIndexerConfigured).mockReturnValue(false);
+    vi.spyOn(rpc.Server.prototype, "getLatestLedger").mockRejectedValue(new Error("RPC down"));
+
+    await expect(getContractEventsPage("contract-id", { limit: 2 })).resolves.toEqual({
+      items: [],
+      nextCursor: null,
+      error: "RPC down",
+    });
+
+    vi.mocked(rpc.Server.prototype.getLatestLedger).mockResolvedValue({ sequence: 10 } as never);
+    vi.spyOn(rpc.Server.prototype, "getEvents").mockResolvedValue({ events: [] } as never);
+    await expect(getContractEventsPage("contract-id", { limit: 2 })).resolves.toEqual({
+      items: [],
+      nextCursor: null,
+      error: null,
+    });
   });
 
   it("returns an empty list when the RPC call fails or returns no events", async () => {

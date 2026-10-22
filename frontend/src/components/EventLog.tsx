@@ -4,10 +4,13 @@ import { shortHash } from "@/lib/format";
 import { labelEventData, labelEventTopics, matchEventSpec } from "@/lib/event-spec";
 import RelativeTime from "@/components/RelativeTime";
 import EmptyState from "@/components/EmptyState";
+import ErrorState from "@/components/ErrorState";
 
 interface Props {
   events: ContractEvent[];
   specs?: ContractEventSpec[];
+  /** Set when the lookup failed; distinct from a successful, empty result. */
+  error?: string | null;
 }
 
 function linkifyAddresses(text: string): React.ReactNode {
@@ -41,7 +44,15 @@ function linkifyAddresses(text: string): React.ReactNode {
   return parts.length > 0 ? parts : text;
 }
 
-export default function EventLog({ events, specs = [] }: Props) {
+export default function EventLog({ events, specs = [], error = null }: Props) {
+  if (error) {
+    return (
+      <ErrorState>
+        Couldn&apos;t load events from the RPC node. {error}
+      </ErrorState>
+    );
+  }
+
   if (events.length === 0) {
     return (
       <EmptyState>

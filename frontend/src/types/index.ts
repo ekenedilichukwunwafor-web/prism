@@ -70,6 +70,11 @@ export interface ContractInfo {
   liveUntilLedgerSeq?: number;
   lastModifiedLedgerSeq?: number;
   instanceStorage: StorageEntry[];
+  assetDetails?: {
+    name?: string;
+    symbol?: string;
+    decimals?: number;
+  };
   creator?: string;
   deploymentLedger?: number;
 }

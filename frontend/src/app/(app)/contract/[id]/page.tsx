@@ -8,6 +8,7 @@ import InvokeTool from "@/components/InvokeTool";
 import LiveEventLog from "@/components/LiveEventLog";
 import CopyButton from "@/components/CopyButton";
 import SectionHeader from "@/components/SectionHeader";
+import { EVENT_PAGE_SIZE, INVOCATION_PAGE_SIZE } from "@/lib/contract-lists";
 
 export const dynamic = "force-dynamic";
 
@@ -32,9 +33,9 @@ export default async function ContractPage({ params }: Props) {
   const contractId = params.id;
   const info = await getContractInfo(contractId);
   const [wasm, eventsPage, invocationsPage, fullStorage] = await Promise.all([
-    info.executable === "wasm" ? getContractWasmInfo(contractId) : Promise.resolve(null),
-    getContractEventsPage(contractId, { limit: EVENTS_LIMIT }),
-    getInvocationHistoryPage(contractId, { limit: INVOCATIONS_LIMIT }),
+    info?.executable === "wasm" ? getContractWasmInfo(contractId) : Promise.resolve(null),
+    getContractEventsPage(contractId, { limit: EVENT_PAGE_SIZE }),
+    getInvocationHistoryPage(contractId, { limit: INVOCATION_PAGE_SIZE }),
     getFullStorageEntries(contractId),
   ]);
 
@@ -65,11 +66,11 @@ export default async function ContractPage({ params }: Props) {
         <section>
           <SectionHeader
             title="Storage"
-            count={fullStorage.length > 0 ? fullStorage.length : (info?.instanceStorage ?? []).length}
+            count={storageCount}
           />
           <ContractStorageView
             contractId={contractId}
-            instanceStorage={info.instanceStorage ?? []}
+            instanceStorage={info?.instanceStorage ?? []}
             fullStorage={fullStorage}
           />
         </section>
@@ -79,16 +80,23 @@ export default async function ContractPage({ params }: Props) {
             contractId={contractId}
             initialItems={invocationsPage.items}
             initialNextCursor={invocationsPage.nextCursor}
-            limit={INVOCATIONS_LIMIT}
+            limit={INVOCATION_PAGE_SIZE}
             derivedFromEvents={rpcFallback}
             title="Recent Invocations"
-          >
-            <LiveBadge />
-          </LiveInvocationHistory>
+          />
         </section>
 
         <section>
-          <LiveEventLog contractId={contractId} initialEvents={events} specs={wasm?.events} />
+          <LiveEventLog
+            contractId={contractId}
+            initialEvents={eventsPage.items}
+            initialNextCursor={eventsPage.nextCursor}
+            initialError={eventsPage.error}
+            limit={EVENT_PAGE_SIZE}
+            rpcFallback={rpcFallback}
+            specs={wasm?.events}
+            title="Events"
+          />
         </section>
       </div>
     </div>

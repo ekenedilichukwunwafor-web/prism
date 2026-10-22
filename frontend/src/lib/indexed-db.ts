@@ -66,6 +66,16 @@ export interface IndexedInvocation {
   sourceAccount: string;
 }
 
+/** The stored return value for a transaction, when the indexer has one. */
+export async function getIndexedInvocationReturnValue(txHash: string): Promise<string | null> {
+  if (!isIndexerConfigured()) return null;
+  const { rows } = await getPool().query(
+    `SELECT "returnValue" FROM "Invocation" WHERE "txHash" = $1`,
+    [txHash]
+  );
+  return rows[0]?.returnValue ?? null;
+}
+
 /**
  * One page of a contract's invocation history since the indexer started, newest
  * first. `before` continues from the cursor a previous page returned.
