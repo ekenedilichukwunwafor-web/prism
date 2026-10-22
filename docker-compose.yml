@@ -39,7 +39,10 @@ services:
       NEXT_PUBLIC_HORIZON_URL: ${NEXT_PUBLIC_HORIZON_URL:-https://horizon-testnet.stellar.org}
       NEXT_PUBLIC_SOROBAN_RPC_URL: ${NEXT_PUBLIC_SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}
       NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
-      DATABASE_URL: postgresql://prism:${POSTGRES_PASSWORD:-prism}@postgres:5432/prism
+      DATABASE_URL: ${DATABASE_URL:-postgresql://prism:${POSTGRES_PASSWORD:-prism}@postgres:5432/prism}
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-10}
+      DATABASE_IDLE_TIMEOUT_MS: ${DATABASE_IDLE_TIMEOUT_MS:-10000}
+      DATABASE_SSL: ${DATABASE_SSL:-false}
     ports:
       - "3000:3000"
     healthcheck:
