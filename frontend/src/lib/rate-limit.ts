@@ -12,9 +12,8 @@ interface Bucket {
  * In-memory, per-process fixed-window limiter. Good enough to stop a single
  * client from hammering the public Horizon/Soroban RPC nodes through this
  * API — NOT distributed, so it resets per instance on a multi-instance
- * deployment. A real deployment behind a shared cache (Redis, etc.) would
- * need a proper distributed limiter instead. Buckets are keyed by
- * `${scope}:${clientKey}` so different routes can carry independent limits.
+ * deployment. Set RATE_LIMIT_REDIS_URL to switch to the Redis-backed store
+ * which enforces a single shared limit across all instances (#28).
  */
 const buckets = new Map<string, Bucket>();
 
@@ -33,9 +32,59 @@ export interface RateLimitResult {
 }
 
 /**
+ * Pluggable store interface for the rate limiter (#28).
+ * The in-memory default is synchronous; a Redis implementation is async.
+ */
+export interface RateLimitStore {
+  increment(key: string, windowMs: number): Promise<{ count: number; ttlMs: number }>;
+}
+
+/**
+ * Redis-backed store. Two instances sharing the same Redis enforce one
+ * combined limit. Selected automatically when RATE_LIMIT_REDIS_URL is set.
+ */
+export class RedisRateLimitStore implements RateLimitStore {
+  private client: import("ioredis").Redis | null = null;
+
+  constructor(private readonly url: string) {}
+
+  private async getClient(): Promise<import("ioredis").Redis> {
+    if (!this.client) {
+      const { default: Redis } = await import("ioredis");
+      this.client = new Redis(this.url, { lazyConnect: true });
+      await this.client.connect();
+    }
+    return this.client;
+  }
+
+  async increment(key: string, windowMs: number): Promise<{ count: number; ttlMs: number }> {
+    const redis = await this.getClient();
+    const windowSec = Math.ceil(windowMs / 1000);
+    // Atomic INCR + EXPIRE: the Lua script ensures the TTL is set exactly once.
+    const result = (await redis.eval(
+      `local c = redis.call('INCR', KEYS[1])
+       if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+       return {c, redis.call('PTTL', KEYS[1])}`,
+      1,
+      key,
+      String(windowSec)
+    )) as [number, number];
+    return { count: result[0], ttlMs: Math.max(0, result[1]) };
+  }
+}
+
+/** The active store — Redis when RATE_LIMIT_REDIS_URL is set, otherwise in-memory. */
+export const rateLimitStore: RateLimitStore | null = process.env.RATE_LIMIT_REDIS_URL
+  ? new RedisRateLimitStore(process.env.RATE_LIMIT_REDIS_URL)
+  : null;
+
+/**
  * Core bucket logic — keyed by an arbitrary string that callers compose.
  * Returns a structured result rather than a NextResponse so it can be used
  * in non-HTTP contexts (tests, background workers, etc.).
+ *
+ * Uses the in-memory store directly (synchronous). For the distributed Redis
+ * path use rateLimitAsync.
  */
 export function rateLimit(key: string, max: number, windowMs: number): RateLimitResult {
   const now = Date.now();
@@ -56,6 +105,25 @@ export function rateLimit(key: string, max: number, windowMs: number): RateLimit
 
   bucket.count += 1;
   return { success: true, remaining: max - bucket.count };
+}
+
+/**
+ * Async rate-limit check that works with any RateLimitStore, including Redis.
+ * Falls back to the in-memory rateLimit() when no store is provided and
+ * RATE_LIMIT_REDIS_URL is not set.
+ */
+export async function rateLimitAsync(
+  key: string,
+  max: number,
+  windowMs: number,
+  store: RateLimitStore | null = rateLimitStore
+): Promise<RateLimitResult> {
+  if (!store) return rateLimit(key, max, windowMs);
+  const { count, ttlMs } = await store.increment(key, windowMs);
+  if (count > max) {
+    return { success: false, remaining: 0, retryAfter: Math.ceil(ttlMs / 1000) };
+  }
+  return { success: true, remaining: max - count };
 }
 
 /**

@@ -1,6 +1,7 @@
 import { rpc, encodeMuxedAccountToAddress, type xdr } from "@stellar/stellar-sdk";
 import { createServer, type Server } from "node:http";
 import { pathToFileURL } from "node:url";
+import { Registry, Counter, Gauge, collectDefaultMetrics } from "prom-client";
 import { prisma, findCursor, seedCursor, setCursor, type Db } from "./db.js";
 import {
   decodeContractCreation,
@@ -10,13 +11,69 @@ import {
   extractStorageChanges,
 } from "./decode.js";
 
-const RPC_URL = process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
-const HEALTH_PORT = Number(process.env.HEALTH_PORT ?? 8080);
-const MAX_LEDGER_LAG = Number(process.env.HEALTH_MAX_LEDGER_LAG ?? 60);
+// ---------------------------------------------------------------------------
+// Environment variable validation (#20)
+// ---------------------------------------------------------------------------
+function requireEnv(name: string, fallback?: string): string {
+  const val = process.env[name] ?? fallback;
+  if (val === undefined) {
+    console.error(`[indexer] fatal: environment variable ${name} is required but not set`);
+    process.exit(1);
+  }
+  return val;
+}
+
+function requirePositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    console.error(
+      `[indexer] fatal: ${name} must be a positive integer, got "${raw}"`
+    );
+    process.exit(1);
+  }
+  return n;
+}
+
+const RPC_URL = requireEnv("SOROBAN_RPC_URL", "https://soroban-testnet.stellar.org");
+const POLL_INTERVAL_MS = requirePositiveInt("POLL_INTERVAL_MS", 5000);
+const HEALTH_PORT = requirePositiveInt("HEALTH_PORT", 8080);
+const MAX_LEDGER_LAG = requirePositiveInt("HEALTH_MAX_LEDGER_LAG", 60);
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
 export const PAGE_LIMIT = 50;
+
+// ---------------------------------------------------------------------------
+// Prometheus metrics (#23)
+// ---------------------------------------------------------------------------
+export const metricsRegistry = new Registry();
+collectDefaultMetrics({ register: metricsRegistry });
+
+export const metricLedgersProcessed = new Counter({
+  name: "indexer_ledgers_processed_total",
+  help: "Total number of ledgers processed by the indexer",
+  registers: [metricsRegistry],
+});
+
+export const metricRowsWritten = new Counter({
+  name: "indexer_rows_written_total",
+  help: "Total rows written, partitioned by table",
+  labelNames: ["table"] as const,
+  registers: [metricsRegistry],
+});
+
+export const metricLag = new Gauge({
+  name: "indexer_ledger_lag",
+  help: "Current lag between the indexer cursor and the network latest ledger",
+  registers: [metricsRegistry],
+});
+
+export const metricPollErrors = new Counter({
+  name: "indexer_poll_errors_total",
+  help: "Total number of poll errors encountered",
+  registers: [metricsRegistry],
+});
 
 export const server = new rpc.Server(RPC_URL, { timeout: 10_000 });
 
@@ -83,17 +140,30 @@ export function seedLastLedger(
 const health: HealthSnapshot = { cursor: 0, latestLedger: 0, lastPollFailed: false };
 
 function startHealthServer(): Server {
-  const httpServer = createServer((req, res) => {
-    if (req.method !== "GET" || req.url?.split("?")[0] !== "/healthz") {
-      res.writeHead(404).end();
+  const httpServer = createServer(async (req, res) => {
+    const path = req.url?.split("?")[0];
+    if (req.method !== "GET") {
+      res.writeHead(405).end();
       return;
     }
-    const report = healthReport(health, MAX_LEDGER_LAG);
-    res.writeHead(report.healthy ? 200 : 503, { "content-type": "application/json" });
-    res.end(JSON.stringify(report));
+    if (path === "/healthz") {
+      const report = healthReport(health, MAX_LEDGER_LAG);
+      res.writeHead(report.healthy ? 200 : 503, { "content-type": "application/json" });
+      res.end(JSON.stringify(report));
+      return;
+    }
+    if (path === "/metrics") {
+      const metrics = await metricsRegistry.metrics();
+      res.writeHead(200, { "content-type": metricsRegistry.contentType });
+      res.end(metrics);
+      return;
+    }
+    res.writeHead(404).end();
   });
   httpServer.listen(HEALTH_PORT, () => {
-    console.log(`[indexer] health endpoint listening on port ${HEALTH_PORT} (GET /healthz)`);
+    console.log(
+      `[indexer] health endpoint listening on port ${HEALTH_PORT} (GET /healthz, GET /metrics)`
+    );
   });
   return httpServer;
 }
@@ -123,7 +193,7 @@ export async function processTransaction(tx: rpc.Api.TransactionInfo, db: Db = p
 
   if (invocation) {
     // skipDuplicates makes reprocessing a page after a crash-before-cursor-advance safe.
-    await db.invocation.createMany({
+    const invocationResult = await db.invocation.createMany({
       data: [
         {
           txHash: tx.txHash,
@@ -140,12 +210,13 @@ export async function processTransaction(tx: rpc.Api.TransactionInfo, db: Db = p
       ],
       skipDuplicates: true,
     });
+    metricRowsWritten.inc({ table: "invocation" }, invocationResult.count);
   }
 
   if (tx.status === "SUCCESS" && sourceAccount) {
     const contract = decodeContractCreation(tx.envelopeXdr, tx.resultMetaXdr, sourceAccount);
     if (contract) {
-      await db.contract.createMany({
+      const contractResult = await db.contract.createMany({
         data: [
           {
             contractId: contract.contractId,
@@ -157,12 +228,13 @@ export async function processTransaction(tx: rpc.Api.TransactionInfo, db: Db = p
         ],
         skipDuplicates: true,
       });
+      metricRowsWritten.inc({ table: "contract" }, contractResult.count);
     }
   }
 
   const changes = extractStorageChanges(tx.resultMetaXdr);
   if (changes.length > 0) {
-    await db.storageChange.createMany({
+    const storageResult = await db.storageChange.createMany({
       skipDuplicates: true,
       data: changes.map((c) => ({
         contractId: c.contractId,
@@ -175,11 +247,12 @@ export async function processTransaction(tx: rpc.Api.TransactionInfo, db: Db = p
         createdAt,
       })),
     });
+    metricRowsWritten.inc({ table: "storageChange" }, storageResult.count);
   }
 
   const events = extractEvents(tx.resultMetaXdr, tx.txHash);
   if (events.length > 0) {
-    await db.contractEventRecord.createMany({
+    const eventsResult = await db.contractEventRecord.createMany({
       skipDuplicates: true,
       data: events.map((e) => ({
         eventId: e.eventId,
@@ -192,6 +265,7 @@ export async function processTransaction(tx: rpc.Api.TransactionInfo, db: Db = p
         createdAt,
       })),
     });
+    metricRowsWritten.inc({ table: "contractEventRecord" }, eventsResult.count);
   }
 }
 
@@ -336,13 +410,18 @@ async function main(): Promise<void> {
           console.log(`[indexer] processed through ledger ${cursor}`);
         }
         caughtUp = cursor >= latestNow.sequence && !paginationCursor;
+        if (page.transactions.length > 0) {
+          metricLedgersProcessed.inc();
+        }
       }
       consecutiveFailures = 0;
       health.lastPollFailed = false;
+      metricLag.set(Math.max(0, health.latestLedger - health.cursor));
       delayMs = caughtUp ? POLL_INTERVAL_MS : 0;
     } catch (err) {
       consecutiveFailures++;
       health.lastPollFailed = true;
+      metricPollErrors.inc();
       delayMs = backoffDelay(consecutiveFailures);
       console.error(
         `[indexer] poll error (failure ${consecutiveFailures}), retrying in ${delayMs}ms:`,
